@@ -1,0 +1,6 @@
+@Centrala_HostAddress = http://localhost:5133
+
+GET {{Centrala_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

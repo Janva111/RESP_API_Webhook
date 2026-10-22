@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Centrala/Centrala.csproj" />
+  <Project Path="Terminal/Terminal.csproj" />
+</Solution>
