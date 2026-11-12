@@ -5,6 +5,7 @@ using System.Net.Http.Json;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -48,6 +49,7 @@ if (!Uri.TryCreate(configuredPublicUrl, UriKind.Absolute, out var publicUri) ||
 var publicUrl = configuredPublicUrl.TrimEnd('/');
 
 var webhooks = new ConcurrentDictionary<int, string>();
+var subscriptions = new ConcurrentDictionary<Guid, Subscription>();
 var votes = new ConcurrentDictionary<string, ConcurrentDictionary<string, Vote>>(
     StringComparer.OrdinalIgnoreCase);
 
@@ -72,6 +74,101 @@ StandStats CreateStandStats(Booth booth)
         voteCount == 0 ? 0.0m : Math.Round((decimal)ratingSum / voteCount, 2),
         boothVotes.Count(vote => vote.Favorite));
 }
+
+async Task NotifySubscribersAsync(VoteNotification notification)
+{
+    var recipients = subscriptions.Values
+        .Where(subscription => subscription.Floor is null || subscription.Floor == notification.Floor)
+        .ToArray();
+    var payloadBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(notification);
+
+    using var client = new HttpClient(new HttpClientHandler { UseProxy = false })
+    {
+        Timeout = TimeSpan.FromSeconds(5)
+    };
+
+    await Task.WhenAll(recipients.Select(async subscription =>
+    {
+        try
+        {
+            var keyBytes = System.Text.Encoding.UTF8.GetBytes(subscription.Secret);
+            using var hmac = new HMACSHA256(keyBytes);
+            var hashBytes = hmac.ComputeHash(payloadBytes);
+            var signature = $"sha256={Convert.ToHexString(hashBytes).ToLowerInvariant()}";
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, subscription.Endpoint)
+            {
+                Content = new ByteArrayContent(payloadBytes)
+            };
+            request.Headers.Add("X-Signature", signature);
+            request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+
+            using var response = await client.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Doručení události odběru {subscription.Id} selhalo ({(int)response.StatusCode}).");
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"Doručení události odběru {subscription.Id} selhalo: {ex.Message}");
+        }
+        catch (TaskCanceledException)
+        {
+            Console.WriteLine($"Doručení události odběru {subscription.Id} vypršelo.");
+        }
+    }));
+}
+
+app.MapPost("/api/subscriptions", (SubscriptionRequest request) =>
+{
+    if (request.Floor is < 1 || string.IsNullOrWhiteSpace(request.Endpoint) ||
+        !Uri.TryCreate(request.Endpoint, UriKind.Absolute, out var endpointUri) ||
+        endpointUri.Scheme is not ("http" or "https"))
+    {
+        return Results.BadRequest("Floor musí být kladné číslo a endpoint musí být platná HTTP(S) adresa.");
+    }
+
+    var subscription = new Subscription(
+        Guid.NewGuid(),
+        endpointUri.ToString(),
+        request.Floor,
+        Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)));
+
+    subscriptions[subscription.Id] = subscription;
+
+    return Results.Created($"/api/subscriptions/{subscription.Id}", new SubscriptionCreatedResponse(
+        subscription.Id,
+        subscription.Secret));
+})
+.WithName("CreateSubscription")
+.WithOpenApi(operation =>
+{
+    operation.Summary = "Vytvoří odběr změn hlasování";
+    operation.Description = "Po uložení hlasu centrála odešle na endpoint POST s událostí vote_created. Odběr s floor null dostává události ze všech pater.";
+    operation.RequestBody.Content["application/json"].Example = new JsonObject
+    {
+        ["endpoint"] = "http://localhost:5207/webhooks/votes",
+        ["floor"] = 2
+    };
+    return operation;
+});
+
+app.MapGet("/api/subscriptions", () =>
+    Results.Ok(subscriptions.Values
+        .Select(subscription => new SubscriptionSummary(
+            subscription.Id,
+            subscription.Endpoint,
+            subscription.Floor))
+        .OrderBy(subscription => subscription.Id)
+        .ToList()))
+.WithName("GetSubscriptions")
+.WithOpenApi();
+
+app.MapDelete("/api/subscriptions/{id:guid}", (Guid id) =>
+    subscriptions.TryRemove(id, out _)
+        ? Results.NoContent()
+        : Results.NotFound());
 
 app.MapPost("/api/webhooky", (WebhookRegistration registration) =>
 {
@@ -117,7 +214,7 @@ app.MapPost("/api/statistika", async (Statistika statistika, CancellationToken c
 .WithName("PublishStatistics")
 .WithOpenApi();
 
-app.MapPost("/api/booths/{standId}/votes", (string standId, VoteRequest? request) =>
+app.MapPost("/api/booths/{standId}/votes", (HttpResponse response, string standId, VoteRequest? request) =>
 {
     var booth = booths.FirstOrDefault(b => string.Equals(b.Id, standId, StringComparison.OrdinalIgnoreCase));
     if (booth is null)
@@ -156,6 +253,15 @@ app.MapPost("/api/booths/{standId}/votes", (string standId, VoteRequest? request
     {
         return Results.Conflict(new { message = "Tento žák už pro tento stánek hlasoval." });
     }
+
+    var notification = new VoteNotification(
+        "vote_created",
+        booth.Floor,
+        booth.Id,
+        booth.Title,
+        vote.Rating,
+        vote.Favorite);
+    response.OnCompleted(() => NotifySubscribersAsync(notification));
 
     return Results.Created($"/api/booths/{booth.Id}/votes", new
     {
@@ -398,6 +504,22 @@ public record Booth(
 public record WebhookRegistration(int Patro, string Url);
 
 public record Statistika(int Patro, int CelkemHlasu);
+
+public record SubscriptionRequest(string Endpoint, int? Floor);
+
+public record SubscriptionCreatedResponse(Guid Id, string Secret);
+
+public record SubscriptionSummary(Guid Id, string Endpoint, int? Floor);
+
+public record Subscription(Guid Id, string Endpoint, int? Floor, string Secret);
+
+public record VoteNotification(
+    [property: System.Text.Json.Serialization.JsonPropertyName("event")] string Event,
+    int Floor,
+    [property: System.Text.Json.Serialization.JsonPropertyName("stand_id")] string StandId,
+    string Title,
+    int Rating,
+    bool Favorite);
 
 public record VoteRequest(string? Username, int? Rating, bool? Favorite);
 
