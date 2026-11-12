@@ -1,11 +1,9 @@
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-// Poslední známá statistika pro zobrazení na obrazovce terminálu
 int aktualniPatro = 1;
 int posledniPocetHlasu = 0;
 
-// 1. Endpoint pro příjem webhooků od centrály
 app.MapPost("/webhook/notifikace", (StatistikaDto data) => {
     if (data.Patro == aktualniPatro)
     {
@@ -15,24 +13,40 @@ app.MapPost("/webhook/notifikace", (StatistikaDto data) => {
     return Results.Ok();
 });
 
-// 2. Jednoduchý pohled na statistiku patra v prohlížeči
 app.MapGet("/", () => $"Terminál pro patro {aktualniPatro}. Aktuální počet hlasů: {posledniPocetHlasu}");
 
-// Spuštění registrace u centrály na pozadí (předpokládáme, že centrála běží např. na portu 5001)
-_ = Task.Run(async () => {
-    await Task.Delay(2000); // Počkáme, než centrála nabehne
-    using var client = new HttpClient();
-    var registrace = new { Patro = aktualniPatro, Url = "http://localhost:5002/webhook/notifikace" }; // Uprav porty podle sebe
+_ = Task.Run(async () =>
+{
+    using var client = new HttpClient(new HttpClientHandler { UseProxy = false })
+    {
+        Timeout = TimeSpan.FromSeconds(5)
+    };
+    var registrace = new { Patro = aktualniPatro, Url = "http://localhost:5207/webhook/notifikace" };
 
-    try
+    for (var pokus = 1; pokus <= 15; pokus++)
     {
-        var response = await client.PostAsJsonAsync("http://localhost:5001/api/webhooky", registrace);
-        Console.WriteLine(response.IsSuccessStatusCode ? "Terminál úspěšně zaregistrován u centrály!" : "Registrace selhala.");
+        try
+        {
+            using var response = await client.PostAsJsonAsync("http://localhost:5133/api/webhooky", registrace);
+
+            if (response.IsSuccessStatusCode)
+            {
+                Console.WriteLine("Terminál úspěšně zaregistrován u centrály!");
+                return;
+            }
+
+            var chyba = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"Registrace selhala ({(int)response.StatusCode}): {chyba}");
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"Centrála zatím není dostupná (pokus {pokus}/15): {ex.Message}");
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(2));
     }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Chyba při komunikaci s centrálou: {ex.Message}");
-    }
+
+    Console.WriteLine("Terminál se nepodařilo zaregistrovat po 15 pokusech.");
 });
 
 app.Run();
