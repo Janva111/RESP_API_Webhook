@@ -55,6 +55,24 @@ var usernamePattern = new Regex(
     @"^[\p{L}\p{N}][\p{L}\p{N}._-]{1,31}$",
     RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+StandStats CreateStandStats(Booth booth)
+{
+    var boothVotes = votes.TryGetValue(booth.Id, out var storedVotes)
+        ? storedVotes.Values.ToArray()
+        : [];
+    var voteCount = boothVotes.Length;
+    var ratingSum = boothVotes.Sum(vote => vote.Rating);
+
+    return new StandStats(
+        booth.Id,
+        booth.Title,
+        booth.Floor,
+        voteCount,
+        ratingSum,
+        voteCount == 0 ? 0.0m : Math.Round((decimal)ratingSum / voteCount, 2),
+        boothVotes.Count(vote => vote.Favorite));
+}
+
 app.MapPost("/api/webhooky", (WebhookRegistration registration) =>
 {
     if (registration.Patro < 1 || string.IsNullOrWhiteSpace(registration.Url) ||
@@ -166,6 +184,31 @@ app.MapPost("/api/booths/{standId}/votes", (string standId, VoteRequest? request
     };
     return operation;
 });
+
+app.MapGet("/api/stats", ([FromQuery] int? floor) =>
+{
+    var selectedBooths = floor.HasValue
+        ? booths.Where(booth => booth.Floor == floor.Value)
+        : booths.AsEnumerable();
+    var stands = selectedBooths.Select(CreateStandStats).ToList();
+
+    return Results.Ok(new StatsResponse(
+        DateTime.UtcNow,
+        stands.Sum(stand => stand.Votes),
+        stands));
+})
+.WithName("GetStats")
+.WithOpenApi();
+
+app.MapGet("/api/stats/{standId}", (string standId) =>
+{
+    var booth = booths.FirstOrDefault(b => string.Equals(b.Id, standId, StringComparison.OrdinalIgnoreCase));
+    return booth is null
+        ? Results.NotFound()
+        : Results.Ok(CreateStandStats(booth));
+})
+.WithName("GetStandStats")
+.WithOpenApi();
 
 app.MapGet("/api/booths/{standId}", (HttpContext httpContext, string standId) =>
 {
@@ -359,3 +402,19 @@ public record Statistika(int Patro, int CelkemHlasu);
 public record VoteRequest(string? Username, int? Rating, bool? Favorite);
 
 public record Vote(string Username, int Rating, bool Favorite);
+
+public record StatsResponse(
+    [property: System.Text.Json.Serialization.JsonPropertyName("generated_at")] DateTime GeneratedAt,
+    [property: System.Text.Json.Serialization.JsonPropertyName("total_votes")] int TotalVotes,
+    List<StandStats> Stands
+);
+
+public record StandStats(
+    [property: System.Text.Json.Serialization.JsonPropertyName("stand_id")] string StandId,
+    string Title,
+    int Floor,
+    int Votes,
+    [property: System.Text.Json.Serialization.JsonPropertyName("rating_sum")] int RatingSum,
+    [property: System.Text.Json.Serialization.JsonPropertyName("avg_rating")] decimal AvgRating,
+    int Favorites
+);
