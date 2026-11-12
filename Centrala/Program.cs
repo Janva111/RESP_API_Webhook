@@ -3,6 +3,8 @@ using QRCoder;
 using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Net;
+using System.Text.RegularExpressions;
+using System.Text.Json.Nodes;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -46,6 +48,12 @@ if (!Uri.TryCreate(configuredPublicUrl, UriKind.Absolute, out var publicUri) ||
 var publicUrl = configuredPublicUrl.TrimEnd('/');
 
 var webhooks = new ConcurrentDictionary<int, string>();
+var votes = new ConcurrentDictionary<string, ConcurrentDictionary<string, Vote>>(
+    StringComparer.OrdinalIgnoreCase);
+
+var usernamePattern = new Regex(
+    @"^[\p{L}\p{N}][\p{L}\p{N}._-]{1,31}$",
+    RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
 app.MapPost("/api/webhooky", (WebhookRegistration registration) =>
 {
@@ -91,12 +99,82 @@ app.MapPost("/api/statistika", async (Statistika statistika, CancellationToken c
 .WithName("PublishStatistics")
 .WithOpenApi();
 
-app.MapGet("/api/booths/{standId}", (string standId) =>
+app.MapPost("/api/booths/{standId}/votes", (string standId, VoteRequest? request) =>
 {
     var booth = booths.FirstOrDefault(b => string.Equals(b.Id, standId, StringComparison.OrdinalIgnoreCase));
-    return booth is null ? Results.NotFound() : Results.Ok(booth);
+    if (booth is null)
+    {
+        return Results.NotFound();
+    }
+
+    var errors = new Dictionary<string, string[]>();
+    var username = request?.Username?.Trim();
+
+    if (string.IsNullOrWhiteSpace(username) || !usernamePattern.IsMatch(username))
+    {
+        errors["username"] = ["Username musí mít 2 až 32 znaků a smí obsahovat pouze písmena, číslice, tečku, podtržítko nebo pomlčku."];
+    }
+
+    if (request?.Rating is null || request.Rating < 1 || request.Rating > 5)
+    {
+        errors["rating"] = ["Rating musí být celé číslo od 1 do 5."];
+    }
+
+    if (request?.Favorite is null)
+    {
+        errors["favorite"] = ["Favorite je povinné a musí být true nebo false."];
+    }
+
+    if (errors.Count > 0)
+    {
+        return Results.Json(new { errors }, statusCode: StatusCodes.Status422UnprocessableEntity);
+    }
+
+    var boothVotes = votes.GetOrAdd(booth.Id, _ => new ConcurrentDictionary<string, Vote>(StringComparer.OrdinalIgnoreCase));
+    var normalizedUsername = username!.ToUpperInvariant();
+    var vote = new Vote(username, request!.Rating!.Value, request.Favorite!.Value);
+
+    if (!boothVotes.TryAdd(normalizedUsername, vote))
+    {
+        return Results.Conflict(new { message = "Tento žák už pro tento stánek hlasoval." });
+    }
+
+    return Results.Created($"/api/booths/{booth.Id}/votes", new
+    {
+        message = "Hlas byl uložen.",
+        booth = booth.Id,
+        username = vote.Username,
+        rating = vote.Rating,
+        favorite = vote.Favorite
+    });
 })
-.WithName("GetBooth")
+.WithName("CreateBoothVote")
+.Accepts<VoteRequest>("application/json")
+.Produces(StatusCodes.Status201Created)
+.Produces(StatusCodes.Status404NotFound)
+.Produces(StatusCodes.Status409Conflict)
+.Produces(StatusCodes.Status422UnprocessableEntity)
+.WithOpenApi(operation =>
+{
+    operation.Summary = "Uloží jeden hlas pro stánek";
+    operation.Description = "Jeden username může pro konkrétní stánek hlasovat pouze jednou. Username se porovnává bez ohledu na velikost písmen.";
+    operation.RequestBody.Content["application/json"].Example = new JsonObject
+    {
+        ["username"] = "novak.jan",
+        ["rating"] = 5,
+        ["favorite"] = true
+    };
+    return operation;
+});
+
+app.MapGet("/api/booths/{standId}", (HttpContext httpContext, string standId) =>
+{
+    var booth = booths.FirstOrDefault(b => string.Equals(b.Id, standId, StringComparison.OrdinalIgnoreCase));
+    return booth is null
+        ? Results.NotFound()
+        : Results.Content(CreateBoothPage(booth, httpContext.Request.PathBase), "text/html; charset=utf-8");
+})
+.WithName("GetBoothPage")
 .WithOpenApi();
 
 app.MapGet("/qr/{standId}.svg", (string standId) =>
@@ -177,6 +255,92 @@ app.MapGet("/api/booths", ([FromQuery] int? floor) =>
     return operation;
 });
 
+string CreateBoothPage(Booth booth, PathString pathBase)
+{
+    var id = WebUtility.HtmlEncode(booth.Id);
+    var title = WebUtility.HtmlEncode(booth.Title);
+    var authors = WebUtility.HtmlEncode(string.Join(", ", booth.Authors));
+    var className = WebUtility.HtmlEncode(booth.ClassName);
+    var room = WebUtility.HtmlEncode(booth.Room);
+    var voteUrl = $"{pathBase}/api/booths/{Uri.EscapeDataString(booth.Id)}/votes";
+
+    return $$"""
+        <!doctype html>
+        <html lang="cs">
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Hlasování – {{title}}</title>
+            <style>
+                :root { color-scheme: light; font-family: system-ui, sans-serif; }
+                body { margin: 0; background: #f3f4f6; color: #172033; }
+                main { max-width: 32rem; margin: auto; padding: 1rem; }
+                .card { background: white; border-radius: 1rem; padding: 1.25rem; box-shadow: 0 2px 12px #0001; }
+                label { display: block; margin-top: 1rem; font-weight: 600; }
+                input[type=text], input[type=number] { box-sizing: border-box; width: 100%; padding: .8rem; margin-top: .35rem; border: 1px solid #c7ccd5; border-radius: .5rem; font-size: 1rem; }
+                .favorite { display: flex; gap: .5rem; align-items: center; }
+                button { width: 100%; margin-top: 1.25rem; padding: .85rem; border: 0; border-radius: .5rem; background: #1769e0; color: white; font-size: 1rem; font-weight: 700; }
+                #result { margin-top: 1rem; padding: .75rem; border-radius: .5rem; }
+                .success { background: #dcfce7; color: #166534; }
+                .error { background: #fee2e2; color: #991b1b; }
+                small { color: #586174; }
+            </style>
+        </head>
+        <body>
+            <main>
+                <section class="card">
+                    <h1>{{title}}</h1>
+                    <p><strong>Autoři:</strong> {{authors}}</p>
+                    <p><strong>Třída:</strong> {{className}}<br><strong>Učebna:</strong> {{room}}</p>
+                    <hr>
+                    <form id="vote-form">
+                        <label for="username">Jméno žáka</label>
+                        <input id="username" name="username" type="text" autocomplete="username" placeholder="novak.jan" required pattern="[A-Za-zÀ-ž0-9][A-Za-zÀ-ž0-9._-]{1,31}">
+                        <small>Např. novak.jan</small>
+
+                        <label for="rating">Hodnocení (1–5)</label>
+                        <input id="rating" name="rating" type="number" min="1" max="5" step="1" required>
+
+                        <label class="favorite"><input id="favorite" name="favorite" type="checkbox"> Označit jako favorita</label>
+                        <button type="submit">Odeslat hlas</button>
+                    </form>
+                    <div id="result" hidden></div>
+                </section>
+            </main>
+            <script>
+                const form = document.getElementById('vote-form');
+                const result = document.getElementById('result');
+                form.addEventListener('submit', async (event) => {
+                    event.preventDefault();
+                    result.hidden = true;
+                    const body = {
+                        username: document.getElementById('username').value,
+                        rating: Number(document.getElementById('rating').value),
+                        favorite: document.getElementById('favorite').checked
+                    };
+                    try {
+                        const response = await fetch('{{voteUrl}}', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(body)
+                        });
+                        const data = await response.json();
+                        result.className = response.ok ? 'success' : 'error';
+                        result.textContent = response.status === 409
+                            ? 'Tento žák už pro tento stánek hlasoval.'
+                            : response.ok ? data.message : Object.values(data.errors ?? {}).flat().join(' ');
+                    } catch {
+                        result.className = 'error';
+                        result.textContent = 'Hlas se nepodařilo odeslat. Zkontrolujte připojení.';
+                    }
+                    result.hidden = false;
+                });
+            </script>
+        </body>
+        </html>
+        """;
+}
+
 app.Run();
 
 public record Booth(
@@ -191,3 +355,7 @@ public record Booth(
 public record WebhookRegistration(int Patro, string Url);
 
 public record Statistika(int Patro, int CelkemHlasu);
+
+public record VoteRequest(string? Username, int? Rating, bool? Favorite);
+
+public record Vote(string Username, int Rating, bool Favorite);
